@@ -1,4 +1,3 @@
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastmcp import FastMCP
 import os
@@ -8,7 +7,6 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "expenses.db")
 
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
-app = FastAPI(title="Expense Tracker API")
 mcp = FastMCP("Expense Tracker")
 
 def init_db():
@@ -26,23 +24,22 @@ def init_db():
 
 init_db()
 
-class ExpenseCreate(BaseModel):
-    date: str
-    amount: float
-    category: str
-    subcategory: str | None = ""
-    note: str | None = ""
-
-@app.post("/expenses")
-def add_expense(payload: ExpenseCreate):
+@mcp.tool()
+def add_expense(
+    date: str,
+    amount: float,
+    category: str,
+    subcategory: str | None = None,
+    note: str | None = None
+):
     """Add a new expense."""
     with sqlite3.connect(DB_PATH) as c:
         cur = c.execute("INSERT INTO expenses (date, amount, category, subcategory, note) VALUES (?, ?, ?, ?, ?)",
-                  (payload.date, payload.amount, payload.category, payload.subcategory, payload.note))
+                  (date, amount, category, subcategory, note))
         c.commit()
         return {"status": "ok", "id": cur.lastrowid}
 
-@app.get("/expenses")
+@mcp.tool()
 def list_expenses(start_date: str, end_date: str):
     """List expense entries with inclusive date range."""
     with sqlite3.connect(DB_PATH) as c:
@@ -50,7 +47,7 @@ def list_expenses(start_date: str, end_date: str):
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
-@app.get("/expenses/summarize")
+@mcp.tool()
 def summarize(start_date: str, end_date: str, category: str = None):
     """summarize expenses by category within an inclusive date range."""
     with sqlite3.connect(DB_PATH) as c:
@@ -72,6 +69,77 @@ def summarize(start_date: str, end_date: str, category: str = None):
         cur = c.execute(query, params)
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+@mcp.tool()
+def edit_expense(
+    expense_id: int,
+    date: str | None = None,
+    amount: float | None = None,
+    category: str | None = None,
+    subcategory: str | None = None,
+    note: str | None = None
+):
+    """Update an existing expense by ID."""
+
+    updates = {
+        "date": date,
+        "amount": amount,
+        "category": category,
+        "subcategory": subcategory,
+        "note": note
+    }
+
+    updates = {key: value for key, value in updates.items() if value is not None}
+
+    if not updates:
+        return {"status": "error", "message": "No fields provided to update"}
+
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute(
+            "SELECT id FROM expenses WHERE id = ?",
+            (expense_id,)
+        )
+
+        if cur.fetchone() is None:
+            return {"status": "error", "message": "Expense not found"}
+
+        set_clause = ", ".join(f"{key} = ?" for key in updates)
+
+        query = f"UPDATE expenses SET {set_clause} WHERE id = ?"
+
+        c.execute(query, (*updates.values(), expense_id))
+        c.commit()
+
+    return {
+        "status": "success",
+        "message": "Expense updated successfully",
+        "expense_id": expense_id,
+        "updated_fields": list(updates.keys())
+    }
+
+@mcp.tool()
+def delete_expense(expense_id: int):
+    """Delete an expense by its ID."""
+
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute(
+            "DELETE FROM expenses WHERE id = ?",
+            (expense_id,)
+        )
+
+        c.commit()
+
+        if cur.rowcount == 0:
+            return {
+                "status": "error",
+                "message": "Expense not found"
+            }
+
+    return {
+        "status": "success",
+        "message": "Expense deleted successfully",
+        "expense_id": expense_id
+    }
 
 @mcp.resource("expense://categories", mime_type="application/json")
 def categories():
