@@ -98,6 +98,7 @@ async def summarize(start_date, end_date, category=None):  # Changed: added asyn
     except Exception as e:
         return {"status": "error", "message": f"Error summarizing expenses: {str(e)}"}
 
+
 @mcp.tool()
 async def edit_expense(
     expense_id: int,
@@ -117,26 +118,42 @@ async def edit_expense(
         "note": note
     }
 
-    updates = {key: value for key, value in updates.items() if value is not None}
+    updates = {
+        key: value
+        for key, value in updates.items()
+        if value is not None
+    }
 
     if not updates:
-        return {"status": "error", "message": "No fields provided to update"}
+        return {
+            "status": "error",
+            "message": "No fields provided to update"
+        }
 
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+    async with aiosqlite.connect(DB_PATH) as c:
+        cur = await c.execute(
             "SELECT id FROM expenses WHERE id = ?",
             (expense_id,)
         )
 
-        if cur.fetchone() is None:
-            return {"status": "error", "message": "Expense not found"}
+        if await cur.fetchone() is None:
+            return {
+                "status": "error",
+                "message": "Expense not found"
+            }
 
-        set_clause = ", ".join(f"{key} = ?" for key in updates)
+        set_clause = ", ".join(
+            f"{key} = ?" for key in updates
+        )
 
         query = f"UPDATE expenses SET {set_clause} WHERE id = ?"
 
-        c.execute(query, (*updates.values(), expense_id))
-        c.commit()
+        await c.execute(
+            query,
+            (*updates.values(), expense_id)
+        )
+
+        await c.commit()
 
     return {
         "status": "success",
@@ -145,17 +162,18 @@ async def edit_expense(
         "updated_fields": list(updates.keys())
     }
 
+
 @mcp.tool()
 async def delete_expense(expense_id: int):
     """Delete an expense by its ID."""
 
-    with sqlite3.connect(DB_PATH) as c:
-        cur = c.execute(
+    async with aiosqlite.connect(DB_PATH) as c:
+        cur = await c.execute(
             "DELETE FROM expenses WHERE id = ?",
             (expense_id,)
         )
 
-        c.commit()
+        await c.commit()
 
         if cur.rowcount == 0:
             return {
@@ -168,6 +186,7 @@ async def delete_expense(expense_id: int):
         "message": "Expense deleted successfully",
         "expense_id": expense_id
     }
+
 
 @mcp.resource("expense:///categories", mime_type="application/json")  # Changed: expense:// → expense:///
 def categories():
