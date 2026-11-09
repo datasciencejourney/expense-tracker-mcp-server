@@ -1,116 +1,287 @@
-# app.py — Minimal MCP + Streamlit chat (correct tool message ordering, no filler rendered)
 
 import os
 import json
 import asyncio
 import streamlit as st
+
+from pathlib import Path
 from dotenv import load_dotenv
 
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
-# ─────────────────────────────
-# MCP servers: local math via uv + fastmcp
-# ─────────────────────────────
-SERVERS = { 
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    ToolMessage,
+    SystemMessage,
+)
+
+# --------------------------------------------------
+# ENVIRONMENT
+# --------------------------------------------------
+
+load_dotenv()
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY not found in .env file")
+
+
+# --------------------------------------------------
+# MCP SERVER CONFIGURATION
+# --------------------------------------------------
+
+SERVERS = {
     "math": {
         "transport": "stdio",
         "command": "/home/lovely/.local/bin/uv",
         "args": [
-            "run",
-            "fastmcp",
-            "run",
-            "/home/lovely/expense-tracker-mcp-server/calculator.py"
-       ]
+            "--directory", "/home/lovely/expense-tracker-mcp-server",
+            "run", "fastmcp", "run", "calculator.py",
+        ],
     },
     "expense": {
-        "transport": "streamable_http",  # if this fails, try "sse"
-        "url": "https://expense-tracker-connector.fastmcp.app/mcp"
-    }
+        "transport": "streamable_http",
+        "url": "https://expense-tracker-connector.fastmcp.app/mcp",
+    },
 }
 
 
-SYSTEM_PROMPT = (
-    "You have access to tools. When you choose to call a tool, do not narrate status updates. "
-    "After tools run, return only a concise final answer."
+# --------------------------------------------------
+# SYSTEM PROMPT
+# --------------------------------------------------
+
+SYSTEM_PROMPT = """
+You are an intelligent assistant with access to two MCP servers.
+
+1. Math server:
+   Use it for mathematical calculations.
+
+2. Expense tracker server:
+   Use it to add, list, summarize, edit and delete expenses.
+
+IMPORTANT RULES:
+
+- Always use the appropriate tool when a request requires it.
+- Never pretend that an operation succeeded without calling its tool.
+- For expense updates, preserve fields that the user did not ask to change.
+- For deletion, identify the correct expense before deleting it.
+- If an expense ID is missing or ambiguous, ask the user for clarification.
+- Do not invent database records.
+- After executing tools, provide a concise response.
+- Do not narrate unnecessary tool execution updates.
+"""
+
+
+# --------------------------------------------------
+# STREAMLIT UI
+# --------------------------------------------------
+
+st.set_page_config(
+    page_title="MCP Chatbot",
+    page_icon="🧰",
+    layout="centered",
 )
 
-st.set_page_config(page_title="MCP Chat", page_icon="🧰", layout="centered")
-st.title("🧰 MCP Chat")
+st.title("🧰 MCP Chatbot")
+st.caption("Gemini + FastMCP + LangChain")
 
-load_dotenv()
 
-# One-time init
+# --------------------------------------------------
+# MCP TOOL DISCOVERY
+# --------------------------------------------------
+
+async def discover_tools():
+    client = MultiServerMCPClient(SERVERS)
+    return await client.get_tools()
+
+
+# --------------------------------------------------
+# CHAT EXECUTION
+# --------------------------------------------------
+
+async def process_message(history, llm_with_tools, tool_by_name):
+
+    # First LLM response
+    response = await llm_with_tools.ainvoke(history)
+
+    history.append(response)
+
+    # Allow multiple tool-call rounds
+    max_rounds = 5
+
+    for _ in range(max_rounds):
+
+        tool_calls = response.tool_calls
+
+        if not tool_calls:
+            return response
+
+        for tc in tool_calls:
+
+            tool_name = tc["name"]
+            tool_args = tc.get("args") or {}
+            tool_id = tc["id"]
+
+            try:
+
+                if tool_name not in tool_by_name:
+                    raise ValueError(
+                        f"Unknown tool: {tool_name}"
+                    )
+
+                tool = tool_by_name[tool_name]
+
+                result = await tool.ainvoke(tool_args)
+
+                result_content = json.dumps(
+                    result,
+                    default=str,
+                    ensure_ascii=False,
+                )
+
+            except Exception as e:
+
+                result_content = json.dumps({
+                    "status": "error",
+                    "message": str(e),
+                })
+
+            history.append(
+                ToolMessage(
+                    content=result_content,
+                    tool_call_id=tool_id,
+                )
+            )
+
+        # Send tool results back to Gemini
+        response = await llm_with_tools.ainvoke(history)
+
+        history.append(response)
+
+    return response
+
+
+# --------------------------------------------------
+# INITIALIZE APPLICATION
+# --------------------------------------------------
+
 if "initialized" not in st.session_state:
-    # 1) LLM
-    st.session_state.llm = ChatOpenAI(model="gpt-5")
 
-    # 2) MCP tools
-    st.session_state.client = MultiServerMCPClient(SERVERS)
-    tools = asyncio.run(st.session_state.client.get_tools())
-    st.session_state.tools = tools
-    st.session_state.tool_by_name = {t.name: t for t in tools}
+    with st.spinner("Connecting to MCP servers..."):
 
-    # 3) Bind tools
-    st.session_state.llm_with_tools = st.session_state.llm.bind_tools(tools)
+        # Initialize Gemini
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-3.5-flash-lite",
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.2,
+        )
 
-    # 4) Conversation state
-    st.session_state.history = [SystemMessage(content=SYSTEM_PROMPT)]
-    st.session_state.initialized = True
+        # Discover tools from both MCP servers
+        tools = asyncio.run(discover_tools())
 
-# Render chat history (skip system + tool messages; hide intermediate AI with tool_calls)
+        # Create tool lookup
+        tool_by_name = {
+            tool.name: tool
+            for tool in tools
+        }
+
+        # Bind MCP tools to Gemini
+        llm_with_tools = llm.bind_tools(tools)
+
+        # Save in Streamlit session
+        st.session_state.llm = llm
+        st.session_state.tools = tools
+        st.session_state.tool_by_name = tool_by_name
+        st.session_state.llm_with_tools = llm_with_tools
+
+        st.session_state.history = [
+            SystemMessage(content=SYSTEM_PROMPT)
+        ]
+
+        st.session_state.initialized = True
+
+    st.success(f"Connected! Discovered {len(tools)} MCP tools.")
+
+
+# --------------------------------------------------
+# DISPLAY AVAILABLE TOOLS
+# --------------------------------------------------
+
+with st.sidebar:
+
+    st.subheader("Connected MCP Tools")
+
+    for tool in st.session_state.tools:
+        st.write(f"🔧 {tool.name}")
+
+    st.divider()
+
+    if st.button("Clear Chat", use_container_width=True):
+
+        st.session_state.history = [
+            SystemMessage(content=SYSTEM_PROMPT)
+        ]
+
+        st.rerun()
+
+
+# --------------------------------------------------
+# RENDER CHAT HISTORY
+# --------------------------------------------------
+
 for msg in st.session_state.history:
+
     if isinstance(msg, HumanMessage):
+
         with st.chat_message("user"):
             st.markdown(msg.content)
-    elif isinstance(msg, AIMessage):
-        # Skip assistant messages that contain tool_calls (intermediate “fetching…”)
-        if getattr(msg, "tool_calls", None):
-            continue
-        with st.chat_message("assistant"):
-            st.markdown(msg.content)
-    # ToolMessage and SystemMessage are not rendered as bubbles
 
-# Chat input
-user_text = st.chat_input("Type a message…")
+    elif isinstance(msg, AIMessage):
+
+        # Hide intermediate tool-call messages
+        if msg.tool_calls:
+            continue
+
+        with st.chat_message("assistant"):
+            st.markdown(msg.content or "")
+
+
+# --------------------------------------------------
+# CHAT INPUT
+# --------------------------------------------------
+
+user_text = st.chat_input("Ask something...")
+
 if user_text:
+
     with st.chat_message("user"):
         st.markdown(user_text)
-    st.session_state.history.append(HumanMessage(content=user_text))
 
-    # First pass: let the model decide whether to call tools
-    first = asyncio.run(st.session_state.llm_with_tools.ainvoke(st.session_state.history))
-    tool_calls = getattr(first, "tool_calls", None)
+    st.session_state.history.append(
+        HumanMessage(content=user_text)
+    )
 
-    if not tool_calls:
-        # No tools → show & store assistant reply
-        with st.chat_message("assistant"):
-            st.markdown(first.content or "")
-        st.session_state.history.append(first)
-    else:
-        # ── IMPORTANT ORDER ──
-        # 1) Append assistant message WITH tool_calls (do NOT render)
-        st.session_state.history.append(first)
+    with st.chat_message("assistant"):
 
-        # 2) Execute requested tools and append ToolMessages (do NOT render)
-        tool_msgs = []
-        for tc in tool_calls:
-            name = tc["name"]
-            args = tc.get("args") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    pass
-            tool = st.session_state.tool_by_name[name]
-            res = asyncio.run(tool.ainvoke(args))
-            tool_msgs.append(ToolMessage(tool_call_id=tc["id"], content=json.dumps(res)))
+        with st.spinner("Thinking..."):
 
-        st.session_state.history.extend(tool_msgs)
+            try:
 
-        # 3) Final assistant reply using tool outputs → render & store
-        final = asyncio.run(st.session_state.llm.ainvoke(st.session_state.history))
-        with st.chat_message("assistant"):
-            st.markdown(final.content or "")
-        st.session_state.history.append(AIMessage(content=final.content or ""))
+                final_response = asyncio.run(
+                    process_message(
+                        st.session_state.history,
+                        st.session_state.llm_with_tools,
+                        st.session_state.tool_by_name,
+                    )
+                )
+
+                st.markdown(
+                    final_response.content or "Done."
+                )
+
+            except Exception as e:
+
+                st.error(f"Error: {str(e)}")
