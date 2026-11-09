@@ -26,7 +26,7 @@ SERVERS = {
     },
     "expense": {
         "transport": "streamable_http",  # if this fails, try "sse"
-        "url": "https://splendid-gold-dingo.fastmcp.app/mcp"
+        "url": "https://expense-tracker-connector.fastmcp.app/mcp"
     }
 }
 
