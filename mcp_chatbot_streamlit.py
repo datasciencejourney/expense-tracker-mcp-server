@@ -1,14 +1,12 @@
-
 import os
 import json
 import asyncio
 import streamlit as st
 
-from pathlib import Path
 from dotenv import load_dotenv
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from fastmcp import Client
 
 from langchain_core.messages import (
     HumanMessage,
@@ -34,18 +32,18 @@ if not GOOGLE_API_KEY:
 # --------------------------------------------------
 
 SERVERS = {
-    "math": {
-        "transport": "stdio",
-        "command": "/home/lovely/.local/bin/uv",
-        "args": [
-            "--directory", "/home/lovely/expense-tracker-mcp-server",
-            "run", "fastmcp", "run", "calculator.py",
-        ],
-    },
-    "expense": {
-        "transport": "streamable_http",
-        "url": "https://expense-tracker-connector.fastmcp.app/mcp",
-    },
+    "mcpServers": {
+        "math": {
+            "command": "/home/lovely/.local/bin/uv",
+            "args": [
+                "--directory", "/home/lovely/expense-tracker-mcp-server",
+                "run", "fastmcp", "run", "calculator.py",
+            ],
+        },
+        "expense": {
+            "url": "https://expense-tracker-connector.fastmcp.app/mcp",
+        },
+    }
 }
 
 
@@ -56,10 +54,10 @@ SERVERS = {
 SYSTEM_PROMPT = """
 You are an intelligent assistant with access to two MCP servers.
 
-1. Math server:
+1. Math server (tools prefixed with math_):
    Use it for mathematical calculations.
 
-2. Expense tracker server:
+2. Expense tracker server (tools prefixed with expense_):
    Use it to add, list, summarize, edit and delete expenses.
 
 IMPORTANT RULES:
@@ -94,8 +92,18 @@ st.caption("Gemini + FastMCP + LangChain")
 # --------------------------------------------------
 
 async def discover_tools():
-    client = MultiServerMCPClient(SERVERS)
-    return await client.get_tools()
+    async with Client(SERVERS) as client:
+        mcp_tools = await client.list_tools()
+
+    # Convert MCP tools into plain dicts that Gemini understands
+    return [
+        {
+            "name": t.name,
+            "description": t.description or "",
+            "parameters": t.input_schema,
+        }
+        for t in mcp_tools
+    ]
 
 
 # --------------------------------------------------
@@ -106,7 +114,6 @@ async def process_message(history, llm_with_tools, tool_by_name):
 
     # First LLM response
     response = await llm_with_tools.ainvoke(history)
-
     history.append(response)
 
     # Allow multiple tool-call rounds
@@ -126,24 +133,27 @@ async def process_message(history, llm_with_tools, tool_by_name):
             tool_id = tc["id"]
 
             try:
-
                 if tool_name not in tool_by_name:
-                    raise ValueError(
-                        f"Unknown tool: {tool_name}"
-                    )
+                    raise ValueError(f"Unknown tool: {tool_name}")
 
-                tool = tool_by_name[tool_name]
+                async with Client(SERVERS) as client:
+                    result = await client.call_tool(tool_name, tool_args)
 
-                result = await tool.ainvoke(tool_args)
+                if result.data is not None:
+                    payload = result.data
+                else:
+                    payload = [
+                        b.text for b in result.content
+                        if hasattr(b, "text")
+                    ]
 
                 result_content = json.dumps(
-                    result,
+                    payload,
                     default=str,
                     ensure_ascii=False,
                 )
 
             except Exception as e:
-
                 result_content = json.dumps({
                     "status": "error",
                     "message": str(e),
@@ -158,7 +168,6 @@ async def process_message(history, llm_with_tools, tool_by_name):
 
         # Send tool results back to Gemini
         response = await llm_with_tools.ainvoke(history)
-
         history.append(response)
 
     return response
@@ -172,19 +181,21 @@ if "initialized" not in st.session_state:
 
     with st.spinner("Connecting to MCP servers..."):
 
-        # Initialize Gemini
+        # Initialize Gemini (check this model name exists in AI Studio)
         llm = ChatGoogleGenerativeAI(
             model="gemini-3.5-flash-lite",
             google_api_key=GOOGLE_API_KEY,
             temperature=0.2,
         )
 
-        # Discover tools from both MCP servers
-        tools = asyncio.run(discover_tools())
+        # Discover tools from both MCP servers (30s timeout)
+        tools = asyncio.run(
+            asyncio.wait_for(discover_tools(), timeout=30)
+        )
 
         # Create tool lookup
         tool_by_name = {
-            tool.name: tool
+            tool["name"]: tool
             for tool in tools
         }
 
@@ -215,7 +226,7 @@ with st.sidebar:
     st.subheader("Connected MCP Tools")
 
     for tool in st.session_state.tools:
-        st.write(f"🔧 {tool.name}")
+        st.write(f"🔧 {tool['name']}")
 
     st.divider()
 
@@ -269,7 +280,6 @@ if user_text:
         with st.spinner("Thinking..."):
 
             try:
-
                 final_response = asyncio.run(
                     process_message(
                         st.session_state.history,
@@ -278,10 +288,7 @@ if user_text:
                     )
                 )
 
-                st.markdown(
-                    final_response.content or "Done."
-                )
+                st.markdown(final_response.content or "Done.")
 
             except Exception as e:
-
                 st.error(f"Error: {str(e)}")
